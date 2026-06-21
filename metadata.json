@@ -1,0 +1,6 @@
+{
+  "name": "Khan Matka Arena",
+  "description": "A React and Firebase web app for Khan Matka single, double, and triple digit guessing with virtual coins, leaderboards, and admin controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

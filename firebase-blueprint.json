@@ -1,0 +1,116 @@
+{
+  "entities": {
+    "AppUser": {
+      "title": "AppUser",
+      "description": "User profile with wallets coins and metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "coins": { "type": "number" },
+        "totalWins": { "type": "number" },
+        "totalGames": { "type": "number" },
+        "blocked": { "type": "boolean" },
+        "role": { "type": "string", "enum": ["user", "admin"] }
+      },
+      "required": ["uid", "name", "email", "coins", "blocked", "role"]
+    },
+    "Market": {
+      "title": "Market",
+      "description": "Active guessing market rooms",
+      "type": "object",
+      "properties": {
+        "marketName": { "type": "string" },
+        "openTime": { "type": "string" },
+        "closeTime": { "type": "string" },
+        "status": { "type": "string", "enum": ["open", "closed"] }
+      },
+      "required": ["marketName", "openTime", "closeTime", "status"]
+    },
+    "GameEntry": {
+      "title": "GameEntry",
+      "description": "User betting slip entry with committed coins",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "marketName": { "type": "string" },
+        "gameType": { "type": "string", "enum": ["Single Open", "Single Close", "Jodi", "Triple Open", "Triple Close"] },
+        "bets": {
+          "type": "array"
+        },
+        "totalCoins": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "win", "loss"] }
+      },
+      "required": ["userId", "userName", "marketName", "gameType", "bets", "totalCoins", "status"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "In-game coins transaction logs",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "type": { "type": "string", "enum": ["play", "win", "deposit", "withdrawal", "bonus"] },
+        "amount": { "type": "number" },
+        "description": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed", "failed"] }
+      },
+      "required": ["userId", "type", "amount", "description", "status"]
+    },
+    "DepositRequest": {
+      "title": "DepositRequest",
+      "description": "Direct deposit claims manually uploaded",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "amount": { "type": "number" },
+        "utr": { "type": "string" },
+        "screenshot": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed", "failed"] }
+      },
+      "required": ["userId", "userName", "amount", "utr", "status"]
+    },
+    "WithdrawalRequest": {
+      "title": "WithdrawalRequest",
+      "description": "Manual instant withdrawal requests",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "amount": { "type": "number" },
+        "upiId": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed", "failed"] }
+      },
+      "required": ["userId", "userName", "amount", "upiId", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "AppUser",
+      "description": "Profiles list"
+    },
+    "/markets/{marketId}": {
+      "schema": "Market",
+      "description": "List of matka game rooms"
+    },
+    "/entries/{entryId}": {
+      "schema": "GameEntry",
+      "description": "User bets logs"
+    },
+    "/transactions/{txId}": {
+      "schema": "Transaction",
+      "description": "Transactions history logs"
+    },
+    "/deposits/{depId}": {
+      "schema": "DepositRequest",
+      "description": "Deposit list"
+    },
+    "/withdrawals/{withId}": {
+      "schema": "WithdrawalRequest",
+      "description": "Withdrawals list"
+    }
+  }
+}
