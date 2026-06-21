@@ -3,6 +3,7 @@ import {
   collection, 
   addDoc, 
   doc, 
+  getDoc,
   getDocs, 
   query, 
   where, 
@@ -63,6 +64,9 @@ interface GameContextType {
   
   // Settle engine
   submitResultsAndCalculate: (marketName: string, openPanel: string, closePanel: string) => Promise<{ success: boolean; msg: string; winsCount: number; winTotalPaid: number }>;
+  submitOpenResult: (marketName: string, openPanel: string) => Promise<{ success: boolean; msg: string; winsCount: number; winTotalPaid: number }>;
+  submitCloseResult: (marketName: string, closePanel: string) => Promise<{ success: boolean; msg: string; winsCount: number; winTotalPaid: number }>;
+  deleteResult: (resultId: string) => Promise<{ success: boolean; msg: string }>;
   
   approveDeposit: (id: string) => Promise<void>;
   rejectDeposit: (id: string) => Promise<void>;
@@ -141,16 +145,22 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setUserEntries([]);
       return;
     }
+    // Query without orderBy to completely bypass the need for custom composite database indexes in sandbox
     const q = query(
       collection(db, 'entries'), 
       where('userId', '==', user.uid), 
-      orderBy('createdAt', 'desc'),
-      limit(100)
+      limit(200)
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const items: GameEntry[] = [];
       snapshot.forEach((snap) => {
         items.push({ id: snap.id, ...snap.data() } as GameEntry);
+      });
+      // Sort client-side descending by createdAt
+      items.sort((a, b) => {
+        const tA = a.createdAt ? (a.createdAt.seconds * 1000 + (a.createdAt.nanoseconds || 0) / 1000050) : Date.now();
+        const tB = b.createdAt ? (b.createdAt.seconds * 1000 + (b.createdAt.nanoseconds || 0) / 1000050) : Date.now();
+        return tB - tA;
       });
       setUserEntries(items);
     }, (err) => {
@@ -165,16 +175,22 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setUserTransactions([]);
       return;
     }
+    // Query without orderBy to completely bypass the need for custom composite database indexes in sandbox
     const q = query(
       collection(db, 'transactions'), 
       where('userId', '==', user.uid), 
-      orderBy('createdAt', 'desc'),
-      limit(50)
+      limit(100)
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const items: Transaction[] = [];
       snapshot.forEach((snap) => {
         items.push({ id: snap.id, ...snap.data() } as Transaction);
+      });
+      // Sort client-side descending by createdAt
+      items.sort((a, b) => {
+        const tA = a.createdAt ? (a.createdAt.seconds * 1000 + (a.createdAt.nanoseconds || 0) / 1000050) : Date.now();
+        const tB = b.createdAt ? (b.createdAt.seconds * 1000 + (b.createdAt.nanoseconds || 0) / 1000050) : Date.now();
+        return tB - tA;
       });
       setUserTransactions(items);
     }, (err) => {
@@ -281,9 +297,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const data = docSnap.data();
         if (data.marketName === 'KHAN MATKA') {
           hasKhanMatka = true;
-        } else {
-          // Delete other markets from DB to keep only KHAN MATKA
-          await deleteDoc(doc(db, 'markets', docSnap.id));
         }
       }
 
@@ -882,6 +895,426 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const submitOpenResult = async (
+    marketName: string,
+    openPanel: string
+  ): Promise<{ success: boolean; msg: string; winsCount: number; winTotalPaid: number }> => {
+    try {
+      const opDigits = openPanel.replace(/\D/g, '');
+      if (opDigits.length !== 3) {
+        return { success: false, msg: "Open panel must contain exactly 3 digits.", winsCount: 0, winTotalPaid: 0 };
+      }
+
+      const opSum = opDigits.split('').reduce((sum, d) => sum + parseInt(d, 10), 0);
+      const openSingleVal = (opSum % 10).toString();
+
+      const resultDateStr = new Date().toISOString().split('T')[0];
+      
+      const qRes = query(
+        collection(db, 'results'),
+        where('marketName', '==', marketName)
+      );
+      const resSnap = await getDocs(qRes);
+
+      let existingDoc = null;
+      let existingData = null;
+
+      if (!resSnap.empty) {
+        const docs = resSnap.docs.map(d => ({ id: d.id, data: d.data() as GameResult }));
+        const matchByDate = docs.find(d => d.data.resultDate === resultDateStr);
+        if (matchByDate) {
+          existingDoc = matchByDate;
+          existingData = matchByDate.data;
+        } else {
+          docs.sort((a, b) => {
+            const tA = a.data.createdAt ? (a.data.createdAt.seconds || 0) : 0;
+            const tB = b.data.createdAt ? (b.data.createdAt.seconds || 0) : 0;
+            return tB - tA;
+          });
+          const mostRecent = docs[0];
+          if (mostRecent) {
+            const createdSecs = mostRecent.data.createdAt ? (mostRecent.data.createdAt.seconds || 0) : 0;
+            const currentSecs = Math.floor(Date.now() / 1000);
+            if (currentSecs - createdSecs < 18 * 60 * 60) {
+              existingDoc = mostRecent;
+              existingData = mostRecent.data;
+            }
+          }
+        }
+      }
+
+      let finalResultStr = '';
+      let currentCloseSingle = '?';
+      let currentClosePanel = '???';
+
+      if (existingDoc && existingData) {
+        currentCloseSingle = existingData.closeSingle || '?';
+        currentClosePanel = existingData.closePanel || '???';
+        
+        const newJodi = openSingleVal + currentCloseSingle;
+        finalResultStr = `${openPanel}-${newJodi}-${currentClosePanel}`;
+
+        await updateDoc(doc(db, 'results', existingDoc.id), {
+          openPanel,
+          openSingle: openSingleVal,
+          jodi: newJodi,
+          finalResult: finalResultStr
+        });
+      } else {
+        const newJodi = openSingleVal + currentCloseSingle;
+        finalResultStr = `${openPanel}-${newJodi}-${currentClosePanel}`;
+        const resultDoc: Omit<GameResult, 'id'> = {
+          marketName,
+          openPanel,
+          closePanel: currentClosePanel,
+          openSingle: openSingleVal,
+          closeSingle: currentCloseSingle,
+          jodi: newJodi,
+          finalResult: finalResultStr,
+          resultDate: resultDateStr,
+          createdAt: serverTimestamp()
+        };
+        await addDoc(collection(db, 'results'), resultDoc);
+      }
+
+      const qPending = query(
+        collection(db, 'entries'),
+        where('marketName', '==', marketName),
+        where('status', '==', 'pending')
+      );
+      const snap = await getDocs(qPending);
+      let winsCount = 0;
+      let winTotalPaid = 0;
+
+      for (const entrySn of snap.docs) {
+        const entryId = entrySn.id;
+        const entry = entrySn.data() as GameEntry;
+
+        if (entry.gameType !== 'Single Open' && entry.gameType !== 'Triple Open') {
+          continue;
+        }
+
+        let totalEntryWinCoins = 0;
+
+        const evaluatedBets = entry.bets.map((bet) => {
+          let isWin = false;
+          let payoutFactor = 1;
+
+          if (entry.gameType === 'Single Open') {
+            isWin = bet.number === openSingleVal;
+            payoutFactor = 9;
+          } else if (entry.gameType === 'Triple Open') {
+            isWin = bet.number === openPanel;
+            payoutFactor = 900;
+          }
+
+          if (isWin) {
+            totalEntryWinCoins += bet.coins * payoutFactor;
+          }
+          return {
+            ...bet,
+            won: isWin,
+            winPayout: isWin ? bet.coins * payoutFactor : 0
+          };
+        });
+
+        const batchSett = writeBatch(db);
+
+        if (totalEntryWinCoins > 0) {
+          winsCount++;
+          winTotalPaid += totalEntryWinCoins;
+
+          batchSett.update(doc(db, 'entries', entryId), {
+            status: 'win',
+            winAmount: totalEntryWinCoins,
+            evaluatedBets
+          });
+
+          batchSett.update(doc(db, 'users', entry.userId), {
+            coins: increment(totalEntryWinCoins),
+            totalWins: increment(1)
+          });
+
+          batchSett.set(doc(collection(db, 'transactions')), {
+            userId: entry.userId,
+            type: 'win',
+            amount: totalEntryWinCoins,
+            description: `Won multiplier payout in ${marketName} [${entry.gameType}] with result: ${finalResultStr}`,
+            status: 'completed',
+            createdAt: serverTimestamp()
+          });
+        } else {
+          batchSett.update(doc(db, 'entries', entryId), {
+            status: 'loss',
+            winAmount: 0,
+            evaluatedBets
+          });
+        }
+
+        await batchSett.commit();
+      }
+
+      return { success: true, msg: `Open Panel winning digits published! Paid out ${winTotalPaid.toLocaleString()} coins for ${winsCount} winning entries!`, winsCount, winTotalPaid };
+    } catch (e: any) {
+      console.error(e);
+      return { success: false, msg: e.message || "Failed to submit Open result.", winsCount: 0, winTotalPaid: 0 };
+    }
+  };
+
+  const submitCloseResult = async (
+    marketName: string,
+    closePanel: string
+  ): Promise<{ success: boolean; msg: string; winsCount: number; winTotalPaid: number }> => {
+    try {
+      const clDigits = closePanel.replace(/\D/g, '');
+      if (clDigits.length !== 3) {
+        return { success: false, msg: "Close panel must contain exactly 3 digits.", winsCount: 0, winTotalPaid: 0 };
+      }
+
+      const clSum = clDigits.split('').reduce((sum, d) => sum + parseInt(d, 10), 0);
+      const closeSingleVal = (clSum % 10).toString();
+
+      const resultDateStr = new Date().toISOString().split('T')[0];
+      
+      const qRes = query(
+        collection(db, 'results'),
+        where('marketName', '==', marketName)
+      );
+      const resSnap = await getDocs(qRes);
+
+      let existingDoc = null;
+      let existingData = null;
+
+      if (!resSnap.empty) {
+        const docs = resSnap.docs.map(d => ({ id: d.id, data: d.data() as GameResult }));
+        const matchByDate = docs.find(d => d.data.resultDate === resultDateStr);
+        if (matchByDate) {
+          existingDoc = matchByDate;
+          existingData = matchByDate.data;
+        } else {
+          docs.sort((a, b) => {
+            const tA = a.data.createdAt ? (a.data.createdAt.seconds || 0) : 0;
+            const tB = b.data.createdAt ? (b.data.createdAt.seconds || 0) : 0;
+            return tB - tA;
+          });
+          const mostRecent = docs[0];
+          if (mostRecent) {
+            const createdSecs = mostRecent.data.createdAt ? (mostRecent.data.createdAt.seconds || 0) : 0;
+            const currentSecs = Math.floor(Date.now() / 1000);
+            if (currentSecs - createdSecs < 18 * 60 * 60) {
+              existingDoc = mostRecent;
+              existingData = mostRecent.data;
+            }
+          }
+        }
+      }
+
+      let finalResultStr = '';
+      let currentOpenSingle = '0';
+      let currentOpenPanel = '???';
+
+      if (existingDoc && existingData) {
+        currentOpenSingle = existingData.openSingle && existingData.openSingle !== '?' ? existingData.openSingle : '0';
+        currentOpenPanel = existingData.openPanel || '???';
+        
+        const newJodi = currentOpenSingle + closeSingleVal;
+        finalResultStr = `${currentOpenPanel}-${newJodi}-${closePanel}`;
+
+        await updateDoc(doc(db, 'results', existingDoc.id), {
+          closePanel,
+          closeSingle: closeSingleVal,
+          jodi: newJodi,
+          finalResult: finalResultStr
+        });
+      } else {
+        const newJodi = '?' + closeSingleVal;
+        finalResultStr = `???-${newJodi}-${closePanel}`;
+        const resultDoc: Omit<GameResult, 'id'> = {
+          marketName,
+          closePanel,
+          openPanel: currentOpenPanel,
+          openSingle: '?',
+          closeSingle: closeSingleVal,
+          jodi: newJodi,
+          finalResult: finalResultStr,
+          resultDate: resultDateStr,
+          createdAt: serverTimestamp()
+        };
+        await addDoc(collection(db, 'results'), resultDoc);
+      }
+
+      const qPending = query(
+        collection(db, 'entries'),
+        where('marketName', '==', marketName),
+        where('status', '==', 'pending')
+      );
+      const snap = await getDocs(qPending);
+      let winsCount = 0;
+      let winTotalPaid = 0;
+
+      for (const entrySn of snap.docs) {
+        const entryId = entrySn.id;
+        const entry = entrySn.data() as GameEntry;
+
+        if (entry.gameType !== 'Single Close' && entry.gameType !== 'Jodi' && entry.gameType !== 'Triple Close') {
+          continue;
+        }
+
+        let totalEntryWinCoins = 0;
+
+        const evaluatedBets = entry.bets.map((bet) => {
+          let isWin = false;
+          let payoutFactor = 1;
+
+          if (entry.gameType === 'Single Close') {
+            isWin = bet.number === closeSingleVal;
+            payoutFactor = 9;
+          } else if (entry.gameType === 'Jodi') {
+            const calculatedJodi = currentOpenSingle + closeSingleVal;
+            isWin = bet.number === calculatedJodi;
+            payoutFactor = 90;
+          } else if (entry.gameType === 'Triple Close') {
+            isWin = bet.number === closePanel;
+            payoutFactor = 900;
+          }
+
+          if (isWin) {
+            totalEntryWinCoins += bet.coins * payoutFactor;
+          }
+          return {
+            ...bet,
+            won: isWin,
+            winPayout: isWin ? bet.coins * payoutFactor : 0
+          };
+        });
+
+        const batchSett = writeBatch(db);
+
+        if (totalEntryWinCoins > 0) {
+          winsCount++;
+          winTotalPaid += totalEntryWinCoins;
+
+          batchSett.update(doc(db, 'entries', entryId), {
+            status: 'win',
+            winAmount: totalEntryWinCoins,
+            evaluatedBets
+          });
+
+          batchSett.update(doc(db, 'users', entry.userId), {
+            coins: increment(totalEntryWinCoins),
+            totalWins: increment(1)
+          });
+
+          batchSett.set(doc(collection(db, 'transactions')), {
+            userId: entry.userId,
+            type: 'win',
+            amount: totalEntryWinCoins,
+            description: `Won multiplier payout in ${marketName} [${entry.gameType}] with result: ${finalResultStr}`,
+            status: 'completed',
+            createdAt: serverTimestamp()
+          });
+        } else {
+          batchSett.update(doc(db, 'entries', entryId), {
+            status: 'loss',
+            winAmount: 0,
+            evaluatedBets
+          });
+        }
+
+        await batchSett.commit();
+      }
+
+      return { success: true, msg: `Close Panel winning digits published! Paid out ${winTotalPaid.toLocaleString()} coins for ${winsCount} winning entries!`, winsCount, winTotalPaid };
+    } catch (e: any) {
+      console.error(e);
+      return { success: false, msg: e.message || "Failed to submit Close result.", winsCount: 0, winTotalPaid: 0 };
+    }
+  };
+
+  const deleteResult = async (resultId: string): Promise<{ success: boolean; msg: string }> => {
+    try {
+      const resRef = doc(db, 'results', resultId);
+      const resSnap = await getDoc(resRef);
+      if (!resSnap.exists()) {
+        return { success: false, msg: "Result document not found." };
+      }
+      const resData = resSnap.data() as GameResult;
+      const { marketName, resultDate } = resData;
+
+      const qEntries = query(
+        collection(db, 'entries'),
+        where('marketName', '==', marketName)
+      );
+      const entriesSnap = await getDocs(qEntries);
+
+      let resetCount = 0;
+      let totalDeducted = 0;
+
+      for (const entrySn of entriesSnap.docs) {
+        const entryId = entrySn.id;
+        const entry = entrySn.data() as GameEntry;
+
+        if (entry.status === 'pending') {
+          continue;
+        }
+
+        let isSameDate = false;
+        if (entry.createdAt) {
+          const entryDateStr = new Date(entry.createdAt.seconds * 1000).toISOString().split('T')[0];
+          if (entryDateStr === resultDate) {
+            isSameDate = true;
+          }
+        }
+
+        if (!isSameDate) {
+          continue;
+        }
+
+        const batchReset = writeBatch(db);
+
+        batchReset.update(doc(db, 'entries', entryId), {
+          status: 'pending',
+          winAmount: 0,
+          evaluatedBets: []
+        });
+
+        if (entry.status === 'win' && entry.winAmount && entry.winAmount > 0) {
+          totalDeducted += entry.winAmount;
+          batchReset.update(doc(db, 'users', entry.userId), {
+            coins: increment(-entry.winAmount),
+            totalWins: increment(-1)
+          });
+
+          const qTx = query(
+            collection(db, 'transactions'),
+            where('userId', '==', entry.userId),
+            where('type', '==', 'win')
+          );
+          const txSnap = await getDocs(qTx);
+          for (const txSn of txSnap.docs) {
+            const txData = txSn.data();
+            if (txData.description && txData.description.includes(marketName)) {
+              batchReset.delete(doc(db, 'transactions', txSn.id));
+            }
+          }
+        }
+
+        await batchReset.commit();
+        resetCount++;
+      }
+
+      await deleteDoc(resRef);
+
+      return { 
+        success: true, 
+        msg: `Successfully deleted result and reset ${resetCount} entries back to "pending"! Deducted a total of ${totalDeducted.toLocaleString()} mistakenly rewarded coins.` 
+      };
+    } catch (e: any) {
+      console.error(e);
+      return { success: false, msg: e.message || "Failed to delete result." };
+    }
+  };
+
   // ===== Deposits approver =====
   // "Approve: coins += amount"
   const approveDeposit = async (id: string) => {
@@ -1012,6 +1445,9 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       deleteNotice,
       
       submitResultsAndCalculate,
+      submitOpenResult,
+      submitCloseResult,
+      deleteResult,
       
       approveDeposit,
       rejectDeposit,

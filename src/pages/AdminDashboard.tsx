@@ -60,13 +60,16 @@ export default function AdminDashboard() {
     toggleNotice, 
     deleteNotice, 
     submitResultsAndCalculate,
+    submitOpenResult,
+    submitCloseResult,
+    deleteResult,
     addMarket,
     updateMarketStatus,
     deleteMarket
   } = useGame();
 
   // Selected sub-tab state
-  const [activeTab, setActiveTab] = useState<'users' | 'results' | 'notices' | 'markets' | 'withdrawals' | 'analytics'>('users');
+  const [activeTab, setActiveTab] = useState<'users' | 'results' | 'deposits' | 'withdrawals' | 'notices' | 'markets'>('users');
 
   // Interactive statistics state
   const [stats, setStats] = useState({
@@ -74,13 +77,15 @@ export default function AdminDashboard() {
     totalEntries: 0,
     coinsUsedToday: 0,
     totalWinners: 0,
-    pendingWithdrawals: 0
+    pendingWithdrawals: 0,
+    pendingDeposits: 0
   });
 
   // Database listings
   const [dbUsers, setDbUsers] = useState<any[]>([]);
   const [dbEntries, setDbEntries] = useState<any[]>([]);
   const [pendingWithdrawalsList, setPendingWithdrawalsList] = useState<any[]>([]);
+  const [pendingDepositsList, setPendingDepositsList] = useState<any[]>([]);
   const [loadingList, setLoadingList] = useState(true);
 
   // Form states: Publish result
@@ -187,6 +192,26 @@ export default function AdminDashboard() {
         ...prev,
         pendingWithdrawals: wlItems.length
       }));
+    });
+
+    // 4. Listen to Pending deposits
+    const qDeps = query(
+      collection(db, 'deposits'),
+      where('status', '==', 'pending')
+    );
+    const unsubscribeDeps = onSnapshot(qDeps, (snap) => {
+      const depItems: any[] = [];
+      snap.forEach((docSnap) => {
+        depItems.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      setPendingDepositsList(depItems);
+      setStats(prev => ({
+        ...prev,
+        pendingDeposits: depItems.length
+      }));
+      setLoadingList(false);
+    }, (err) => {
+      console.warn("Deposits snap loading:", err);
       setLoadingList(false);
     });
 
@@ -194,11 +219,12 @@ export default function AdminDashboard() {
       unsubscribeUsers();
       unsubscribeEntries();
       unsubscribeTxs();
+      unsubscribeDeps();
     };
   }, []);
 
-  // Action: Publish daily game results and execute payout allocations!
-  const handlePublishResult = async (e: React.FormEvent) => {
+  // Action: Publish daily game OPEN results
+  const handlePublishOpenResult = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
@@ -213,25 +239,74 @@ export default function AdminDashboard() {
       return;
     }
 
+    setPublishing(true);
+    try {
+      const report = await submitOpenResult(resultMarket, openPanelInput);
+      if (report.success) {
+        setSuccessMsg(`⚜️ OPEN COMPONENT SETTLED! ${report.msg}`);
+        setOpenPanelInput('');
+      } else {
+        setErrorMsg(report.msg || "Failed to settle open results.");
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || "Failed to publish open result.");
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  // Action: Publish daily game CLOSE results
+  const handlePublishCloseResult = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg('');
+    setSuccessMsg('');
+
+    if (!resultMarket) {
+      setErrorMsg("Please select a target Game Market session");
+      return;
+    }
+
     if (closePanelInput.length !== 3 || isNaN(Number(closePanelInput))) {
-      setErrorMsg("Close Panel must be a 3-digit number (e.g., 234)");
+      setErrorMsg("Close Panel must be a 3-digit number (e.g., 456)");
       return;
     }
 
     setPublishing(true);
     try {
-      const report = await submitResultsAndCalculate(resultMarket, openPanelInput, closePanelInput);
+      const report = await submitCloseResult(resultMarket, closePanelInput);
       if (report.success) {
-        setSuccessMsg(`⚜️ RESULT DECLARATION SUCCESSFUL! Settled and paid out ${report.winTotalPaid.toLocaleString()} coins across ${report.winsCount} winning bets for ${resultMarket}!`);
-        setOpenPanelInput('');
+        setSuccessMsg(`⚜️ CLOSE COMPONENT SETTLED! ${report.msg}`);
         setClosePanelInput('');
       } else {
-        setErrorMsg(report.msg || "Failed to settle results.");
+        setErrorMsg(report.msg || "Failed to settle close results.");
       }
     } catch (err: any) {
-      setErrorMsg(err.message || "Failed to publish result.");
+      setErrorMsg(err.message || "Failed to publish close result.");
     } finally {
       setPublishing(false);
+    }
+  };
+
+  const [deletingResult, setDeletingResult] = useState<boolean>(false);
+
+  const handleDeleteResult = async (resultId: string) => {
+    if (!window.confirm("ARE YOU ABSOLUTELY SURE? This will DELETE this declared result and automatically RESET all matching player entries back to 'pending'. This will also deduct any winnings previously added to player balances to keep coins state safe!")) {
+      return;
+    }
+    setErrorMsg('');
+    setSuccessMsg('');
+    setDeletingResult(true);
+    try {
+      const report = await deleteResult(resultId);
+      if (report.success) {
+        setSuccessMsg(report.msg);
+      } else {
+        setErrorMsg(report.msg);
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || "Failed to delete result.");
+    } finally {
+      setDeletingResult(false);
     }
   };
 
@@ -349,6 +424,66 @@ export default function AdminDashboard() {
     }
   };
 
+  // Action: Approve user Deposit Claim
+  const handleApproveDeposit = async (depId: string, userId: string, amount: number, utr: string) => {
+    try {
+      const batch = writeBatch(db);
+      
+      // 1. Approve the deposit doc
+      batch.update(doc(db, 'deposits', depId), { status: 'approved' });
+      
+      // 2. Add Coins to the user wallet
+      batch.update(doc(db, 'users', userId), {
+        coins: increment(amount)
+      });
+
+      // 3. Update transaction log status to 'completed'
+      const txSnap = await getDocs(query(collection(db, 'transactions'), where('userId', '==', userId), where('status', '==', 'pending')));
+      const matchedTx = txSnap.docs.find(tx => tx.data().description?.includes(utr) || tx.data().description?.includes(depId) || tx.data().amount === amount);
+      if (matchedTx) {
+        batch.update(doc(db, 'transactions', matchedTx.id), { status: 'completed', description: `Deposit approved (UTR: ${utr})` });
+      } else {
+        // Fallback: Create new transaction log if not found
+        const txRef = doc(collection(db, 'transactions'));
+        batch.set(txRef, {
+          userId,
+          type: 'deposit',
+          amount,
+          description: `Deposit Approved (UTR: ${utr})`,
+          status: 'completed',
+          createdAt: serverTimestamp()
+        });
+      }
+
+      await batch.commit();
+      setSuccessMsg(`Deposit request of ${amount.toLocaleString()} coins approved for player successfully!`);
+    } catch (e: any) {
+      setErrorMsg(e.message);
+    }
+  };
+
+  // Action: Reject user Deposit Claim
+  const handleRejectDeposit = async (depId: string, userId: string, amount: number, utr: string) => {
+    try {
+      const batch = writeBatch(db);
+      
+      // 1. Reject the deposit doc
+      batch.update(doc(db, 'deposits', depId), { status: 'rejected' });
+      
+      // 2. Update transaction log status to 'rejected'
+      const txSnap = await getDocs(query(collection(db, 'transactions'), where('userId', '==', userId), where('status', '==', 'pending')));
+      const matchedTx = txSnap.docs.find(tx => tx.data().description?.includes(utr) || tx.data().description?.includes(depId) || tx.data().amount === amount);
+      if (matchedTx) {
+        batch.update(doc(db, 'transactions', matchedTx.id), { status: 'rejected', description: `Deposit request rejected (UTR: ${utr})` });
+      }
+
+      await batch.commit();
+      setSuccessMsg(`Deposit request of ${amount.toLocaleString()} coins was rejected successfully.`);
+    } catch (e: any) {
+      setErrorMsg(e.message);
+    }
+  };
+
   // Filter users by search bar input
   const filteredUsers = dbUsers.filter(u => 
     u.name.toLowerCase().includes(userSearch.toLowerCase()) ||
@@ -436,8 +571,8 @@ export default function AdminDashboard() {
         {[
           { key: 'users', label: 'USER MANAGEMENT', icon: Users },
           { key: 'results', label: 'DECLARATIONS OUT', icon: Target },
+          { key: 'deposits', label: 'DEPOSIT CLAIMS', icon: PlusCircle },
           { key: 'withdrawals', label: 'FINANCE REQUESTS', icon: Coins },
-          { key: 'analytics', label: 'NUMBER ANALYTICS', icon: TrendingUp },
           { key: 'notices', label: 'NOTICES BOARD', icon: Megaphone },
           { key: 'markets', label: 'MARKETS TIMES', icon: PlusCircle }
         ].map((tab) => {
@@ -456,7 +591,10 @@ export default function AdminDashboard() {
               <Icon className="w-3.5 h-3.5" />
               {tab.label}
               {tab.key === 'withdrawals' && stats.pendingWithdrawals > 0 && (
-                <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
+              )}
+              {tab.key === 'deposits' && stats.pendingDeposits > 0 && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
               )}
             </button>
           );
@@ -615,10 +753,10 @@ export default function AdminDashboard() {
                     Select the active market room, digit model type (Single, Jodi, or Panel), and key in the final winning number. Upon clicking "PUBLISH", the server-side calculations automatically scan pending bets, allocate multiple payouts (9x, 90x, 900x), debit/credit player balances, and declare history results completely! This is an absolute real-time engine.
                   </p>
 
-                  <form onSubmit={handlePublishResult} className="space-y-4 p-5 bg-zinc-900/40 border border-amber-500/10 rounded-xl">
+                  <div className="space-y-4 p-5 bg-zinc-900/40 border border-amber-500/10 rounded-xl">
                     {/* Market selection */}
                     <div>
-                      <label className="block text-[10px] font-mono text-amber-505 uppercase tracking-wider mb-1.5">1. Target Game Market</label>
+                      <label className="block text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-1.5 font-bold">1. Target Game Market</label>
                       <select 
                         value={resultMarket}
                         onChange={(e) => setResultMarket(e.target.value)}
@@ -634,48 +772,70 @@ export default function AdminDashboard() {
                       </select>
                     </div>
 
-                     <div className="grid grid-cols-2 gap-4">
-                      {/* Open Panel */}
-                      <div>
-                        <label className="block text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-1.5 font-bold">
-                          2. Open Panel (3-D, e.g. "123")
-                        </label>
-                        <input 
-                          type="text" 
-                          value={openPanelInput}
-                          onChange={(e) => setOpenPanelInput(e.target.value.replace(/[^0-9]/g, ''))}
-                          placeholder="123"
-                          maxLength={3}
-                          className="w-full bg-zinc-900 border border-amber-550/25 focus:border-amber-400 text-amber-400 text-center text-lg font-black font-serif px-3 py-2 rounded-lg outline-none placeholder-zinc-800"
-                          required
-                        />
-                      </div>
+                    <div className="border-t border-amber-500/10 pt-4 grid grid-cols-1 sm:grid-cols-2 gap-6">
+                      {/* Option A: OPEN PANEL PUBLISH */}
+                      <form onSubmit={handlePublishOpenResult} className="space-y-3 bg-black/40 p-4 border border-amber-500/5 rounded-lg flex flex-col justify-between">
+                        <div>
+                          <span className="inline-block px-2 py-0.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 font-mono text-[9px] uppercase rounded-full mb-2 font-bold">
+                            OPTION A: MAIN OPEN
+                          </span>
+                          <label className="block text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-1.5 font-bold">
+                            Open Panel (3-D, e.g. "123")
+                          </label>
+                          <p className="text-[11px] text-zinc-500 mb-2 leading-tight">
+                            Settles 'Single Open' & 'Triple Open' bets immediately.
+                          </p>
+                          <input 
+                            type="text" 
+                            value={openPanelInput}
+                            onChange={(e) => setOpenPanelInput(e.target.value.replace(/[^0-9]/g, ''))}
+                            placeholder="123"
+                            maxLength={3}
+                            className="w-full bg-zinc-900 border border-amber-550/25 focus:border-amber-400 text-amber-400 text-center text-lg font-black font-serif px-3 py-2 rounded-lg outline-none placeholder-zinc-800"
+                          />
+                        </div>
 
-                      {/* Close Panel */}
-                      <div>
-                        <label className="block text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-1.5 font-bold">
-                          3. Close Panel (3-D, e.g. "456")
-                        </label>
-                        <input 
-                          type="text" 
-                          value={closePanelInput}
-                          onChange={(e) => setClosePanelInput(e.target.value.replace(/[^0-9]/g, ''))}
-                          placeholder="456"
-                          maxLength={3}
-                          className="w-full bg-zinc-900 border border-amber-550/25 focus:border-amber-400 text-amber-400 text-center text-lg font-black font-serif px-3 py-2 rounded-lg outline-none placeholder-zinc-800"
-                          required
-                        />
-                      </div>
+                        <button
+                          type="submit"
+                          disabled={publishing || !resultMarket || openPanelInput.length !== 3}
+                          className="w-full mt-3 py-2.5 bg-gradient-to-r from-amber-600 to-amber-500 disabled:opacity-30 disabled:from-zinc-800 disabled:to-zinc-800 text-zinc-950 font-serif font-black tracking-widest text-[10px] uppercase rounded transition-all cursor-pointer font-bold"
+                        >
+                          {publishing ? 'PUBLISHING...' : 'PUBLISH OPEN RESULT'}
+                        </button>
+                      </form>
+
+                      {/* Option B: CLOSE PANEL PUBLISH */}
+                      <form onSubmit={handlePublishCloseResult} className="space-y-3 bg-black/40 p-4 border border-amber-500/5 rounded-lg flex flex-col justify-between">
+                        <div>
+                          <span className="inline-block px-2 py-0.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 font-mono text-[9px] uppercase rounded-full mb-2 font-bold">
+                            OPTION B: MAIN CLOSE
+                          </span>
+                          <label className="block text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-1.5 font-bold">
+                            Close Panel (3-D, e.g. "456")
+                          </label>
+                          <p className="text-[11px] text-zinc-500 mb-2 leading-tight">
+                            Settles 'Single Close', 'Jodi', & 'Triple Close' bets immediately.
+                          </p>
+                          <input 
+                            type="text" 
+                            value={closePanelInput}
+                            onChange={(e) => setClosePanelInput(e.target.value.replace(/[^0-9]/g, ''))}
+                            placeholder="456"
+                            maxLength={3}
+                            className="w-full bg-zinc-900 border border-amber-550/25 focus:border-amber-400 text-amber-400 text-center text-lg font-black font-serif px-3 py-2 rounded-lg outline-none placeholder-zinc-800"
+                          />
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={publishing || !resultMarket || closePanelInput.length !== 3}
+                          className="w-full mt-3 py-2.5 bg-gradient-to-r from-amber-600 to-amber-500 disabled:opacity-30 disabled:from-zinc-800 disabled:to-zinc-800 text-zinc-950 font-serif font-black tracking-widest text-[10px] uppercase rounded transition-all cursor-pointer font-bold"
+                        >
+                          {publishing ? 'PUBLISHING...' : 'PUBLISH CLOSE RESULT'}
+                        </button>
+                      </form>
                     </div>
-
-                    <button
-                      type="submit"
-                      disabled={publishing || !resultMarket || openPanelInput.length !== 3 || closePanelInput.length !== 3}
-                      className="w-full py-3 bg-gradient-to-r from-amber-600 via-yellow-450 to-amber-600 hover:from-amber-500 hover:to-amber-550 disabled:opacity-50 text-zinc-955 font-serif font-black tracking-widest text-xs uppercase rounded-lg shadow-lg cursor-pointer"
-                    >
-                      {publishing ? 'SETTLING ALL PLACED ENTRIES...' : 'PUBLISH & SETTLE WIN TICKETS'}
-                    </button>
-                  </form>
+                  </div>
                 </div>
 
                 {/* Analytical Charts */}
@@ -703,8 +863,52 @@ export default function AdminDashboard() {
                         </ResponsiveContainer>
                       </div>
                     </div>
+
+                    {/* Recent Declarations list for admin control */}
+                    <div className="border-t border-amber-500/10 pt-4">
+                      <p className="text-[10px] font-mono text-amber-500 uppercase tracking-wider mb-3 font-bold flex justify-between">
+                        <span>RECENT DECLARATIONS SUMMARY CONTROLS:</span>
+                        <span className="text-zinc-650">({recentResults.length})</span>
+                      </p>
+
+                      <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
+                        {recentResults.length === 0 ? (
+                          <p className="text-zinc-500 text-xs font-mono py-4 text-center">No results declared yet.</p>
+                        ) : (
+                          recentResults.map((res) => (
+                            <div 
+                              key={res.id} 
+                              className="p-3 bg-zinc-950/80 border border-neutral-900 rounded-lg flex justify-between items-center gap-4 text-xs font-mono hover:border-amber-500/10 transition-colors"
+                            >
+                              <div className="space-y-1">
+                                <div className="text-xs font-bold text-neutral-205 uppercase">{res.marketName}</div>
+                                <div className="text-[10px] text-zinc-500 flex gap-2">
+                                  <span>Date: {res.resultDate}</span>
+                                  <span>•</span>
+                                  <span className="text-amber-400 font-serif font-bold">{res.finalResult}</span>
+                                </div>
+                              </div>
+                              
+                              <button
+                                onClick={() => res.id && handleDeleteResult(res.id)}
+                                disabled={deletingResult}
+                                className="px-2.5 py-1 bg-red-950/30 border border-red-500/20 text-red-400 hover:bg-neutral-900 hover:text-red-300 disabled:opacity-30 rounded text-[9px] uppercase tracking-wider font-bold transition-all cursor-pointer"
+                              >
+                                {deletingResult ? "RECOILING..." : "DELETE & RESET"}
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
+                
+                {/* Number-Wise Analytics Integration */}
+                <div className="border-t border-amber-500/10 pt-8 lg:col-span-2">
+                  <AdminNumberAnalytics dbEntries={dbEntries} markets={markets} />
+                </div>
+
               </div>
             )}
 
@@ -765,6 +969,77 @@ export default function AdminDashboard() {
                         <tr>
                           <td colSpan={4} className="text-center py-12 text-neutral-500 italic">
                             No pending withdrawals requested for today.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* TAB: Deposits Claims pending approvals */}
+            {activeTab === 'deposits' && (
+              <div className="space-y-6 animate-fadeIn">
+                <h3 className="font-serif font-black text-sm text-amber-400 uppercase tracking-widest border-b border-amber-500/10 pb-3">
+                  Pending Manual Deposit Claims ({pendingDepositsList.length})
+                </h3>
+
+                <p className="text-neutral-400 text-xs">
+                  Inspect manual direct UPI transfers and claim receipts submitted by sandbox testing players. Approving credits the user wallet account instantly!
+                </p>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-neutral-900 text-[10px] font-mono text-neutral-500 uppercase">
+                        <th className="py-2.5 px-3">Player Detail</th>
+                        <th className="py-2.5 px-3">Date Submitted</th>
+                        <th className="py-2.5 px-3">UTR Reference</th>
+                        <th className="py-2.5 px-3">Amount Deposited</th>
+                        <th className="py-2.5 px-3 text-right">Approval decisions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-xs font-mono text-neutral-350">
+                      {pendingDepositsList.map((dep, idx) => (
+                        <tr 
+                          key={dep.id || idx}
+                          className="border-b border-neutral-900/40 hover:bg-neutral-900/10 transition-colors"
+                        >
+                          <td className="py-3 px-3">
+                            <div className="font-serif text-neutral-200">{dep.userName || 'Unknown Player'}</div>
+                            <div className="text-[10px] text-neutral-500">ID: {dep.userId.substring(0, 12)}...</div>
+                          </td>
+                          <td className="py-3 px-3 text-neutral-400">
+                            {dep.createdAt ? new Date(dep.createdAt.seconds * 1000).toLocaleString() : 'Just now'}
+                          </td>
+                          <td className="py-3 px-3 text-amber-500 font-bold select-all">
+                            {dep.utr}
+                          </td>
+                          <td className="py-3 px-3 font-serif font-bold text-emerald-400">
+                            ₹ {(dep.amount || 0).toLocaleString()} Coins
+                          </td>
+                          <td className="py-3 px-3 text-right space-x-1.5 font-bold">
+                            <button
+                              onClick={() => handleApproveDeposit(dep.id, dep.userId, dep.amount, dep.utr)}
+                              className="px-3 py-1 bg-gradient-to-r from-emerald-600 to-green-405 text-zinc-950 text-[10px] font-serif rounded uppercase font-bold cursor-pointer"
+                            >
+                              APPROVE CREDIT
+                            </button>
+                            <button
+                              onClick={() => handleRejectDeposit(dep.id, dep.userId, dep.amount, dep.utr)}
+                              className="px-3 py-1 bg-zinc-90 border border-neutral-800 text-red-400 hover:bg-neutral-900 text-[10px] font-serif rounded uppercase font-bold cursor-pointer"
+                            >
+                              REJECT
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+
+                      {pendingDepositsList.length === 0 && (
+                        <tr>
+                          <td colSpan={5} className="text-center py-12 text-neutral-500 italic">
+                            No pending manual deposit claim receipts found in database.
                           </td>
                         </tr>
                       )}
@@ -955,10 +1230,6 @@ export default function AdminDashboard() {
               </div>
             )}
 
-            {/* TAB 6: REAL-TIME NUMBER ANALYTICS */}
-            {activeTab === 'analytics' && (
-              <AdminNumberAnalytics dbEntries={dbEntries} markets={markets} />
-            )}
 
           </>
         )}
